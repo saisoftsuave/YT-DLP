@@ -1,0 +1,9 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+yt-dlp==2023.11.16
+beautifulsoup4==4.12.2
+httpx==0.25.1
+redis==5.0.1
+python-multipart==0.0.6
+pydantic==2.5.0
+lxml==4.9.3
