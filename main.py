@@ -1,18 +1,14 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
+import glob
+import os
+import tempfile
+from typing import Optional, List, Dict
+
+import httpx
+import yt_dlp
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
-from typing import Optional, List, Dict
-import yt_dlp
-import re
-import httpx
-from bs4 import BeautifulSoup
-import redis
-import json
-from datetime import timedelta
-import tempfile
-import os
-from pathlib import Path
-import glob
 
 app = FastAPI(title="Social Media Downloader API", version="1.0.0")
 
@@ -35,6 +31,11 @@ class DownloadRequest(BaseModel):
 class FormatDownloadRequest(BaseModel):
     url: HttpUrl
     format_id: Optional[str] = None
+
+
+class PhotoDownloadRequest(BaseModel):
+    url: HttpUrl
+    quality: Optional[str] = "best"  # best, high, medium, low
 
 
 class MediaInfo(BaseModel):
@@ -495,6 +496,166 @@ async def download_format(request: FormatDownloadRequest):
         raise HTTPException(status_code=400, detail=f"yt-dlp download error: {error_msg}")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to download media: {str(e)}")
+    finally:
+        # Clean up temp directory and all files in it
+        try:
+            for file in glob.glob(os.path.join(temp_dir, '*')):
+                os.unlink(file)
+            os.rmdir(temp_dir)
+        except:
+            pass
+
+
+@app.post("/api/download_photo")
+async def download_photo(request: PhotoDownloadRequest):
+    """Download photo/image from social media"""
+    url = str(request.url)
+
+    # Detect platform
+    platform = detect_platform(url)
+    if platform == 'unknown':
+        raise HTTPException(status_code=400, detail="Unsupported platform")
+
+    # Create a unique temporary directory
+    temp_dir = tempfile.mkdtemp()
+
+    try:
+        # Define output template
+        output_template = os.path.join(temp_dir, 'photo')
+
+        # Options for downloading images
+        ydl_opts = {
+            'format': 'best',
+            'outtmpl': output_template,
+            'quiet': False,
+            'no_warnings': False,
+            'noplaylist': True,
+            'nocheckcertificate': True,
+            'skip_download': False,
+            'writethumbnail': False,
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': 'en-us,en;q=0.5',
+            },
+        }
+
+        # Try yt-dlp first (works for many platforms)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                title = info.get('title', 'downloaded_photo')
+                # Clean title for filename
+                title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()
+
+            # Find the downloaded file
+            downloaded_files = glob.glob(os.path.join(temp_dir, 'photo*'))
+
+            if downloaded_files:
+                downloaded_file = downloaded_files[0]
+            else:
+                raise Exception("No file downloaded via yt-dlp")
+
+        except Exception as yt_dlp_error:
+            # Fallback to direct HTTP download for images
+            async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+                # Try to get the image URL from meta tags
+                try:
+                    response = await client.get(url, headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    })
+                    soup = BeautifulSoup(response.text, 'html.parser')
+
+                    # Try different meta tags for images
+                    image_url = None
+                    og_image = soup.find('meta', property='og:image')
+                    twitter_image = soup.find('meta', property='twitter:image')
+
+                    if og_image and og_image.get('content'):
+                        image_url = og_image['content']
+                    elif twitter_image and twitter_image.get('content'):
+                        image_url = twitter_image['content']
+                    else:
+                        # Try to find img tags
+                        img_tags = soup.find_all('img')
+                        for img in img_tags:
+                            if img.get('src') and ('http' in img['src']):
+                                image_url = img['src']
+                                break
+
+                    if not image_url:
+                        raise HTTPException(status_code=404, detail="No image found at URL")
+
+                    # Download the image
+                    img_response = await client.get(image_url)
+                    if img_response.status_code != 200:
+                        raise HTTPException(status_code=400, detail="Failed to download image")
+
+                    # Determine file extension from content-type or URL
+                    content_type = img_response.headers.get('content-type', '')
+                    if 'jpeg' in content_type or 'jpg' in content_type:
+                        ext = 'jpg'
+                    elif 'png' in content_type:
+                        ext = 'png'
+                    elif 'webp' in content_type:
+                        ext = 'webp'
+                    elif 'gif' in content_type:
+                        ext = 'gif'
+                    else:
+                        # Try to get from URL
+                        ext = image_url.split('.')[-1].split('?')[0][:4]
+                        if ext not in ['jpg', 'jpeg', 'png', 'webp', 'gif']:
+                            ext = 'jpg'
+
+                    downloaded_file = os.path.join(temp_dir, f'photo.{ext}')
+                    with open(downloaded_file, 'wb') as f:
+                        f.write(img_response.content)
+
+                    title = "downloaded_photo"
+
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"Failed to download photo: {str(e)}")
+
+        # Get file extension
+        file_ext = os.path.splitext(downloaded_file)[1][1:] if '.' in os.path.basename(downloaded_file) else 'jpg'
+
+        # If no extension, try to detect from file content
+        if not file_ext or file_ext == '':
+            file_ext = 'jpg'
+
+        # Determine MIME type
+        mime_types = {
+            'jpg': 'image/jpeg',
+            'jpeg': 'image/jpeg',
+            'png': 'image/png',
+            'webp': 'image/webp',
+            'gif': 'image/gif',
+            'bmp': 'image/bmp',
+            'svg': 'image/svg+xml',
+        }
+        mime_type = mime_types.get(file_ext.lower(), 'image/jpeg')
+
+        # Read and return the file
+        if os.path.exists(downloaded_file) and os.path.getsize(downloaded_file) > 0:
+            with open(downloaded_file, 'rb') as f:
+                content = f.read()
+
+            return Response(
+                content=content,
+                media_type=mime_type,
+                headers={
+                    'Content-Disposition': f'attachment; filename="{title}.{file_ext}"',
+                    'Content-Length': str(len(content))
+                }
+            )
+        else:
+            raise HTTPException(status_code=400, detail="Downloaded file is empty or not created")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download photo: {str(e)}")
     finally:
         # Clean up temp directory and all files in it
         try:
