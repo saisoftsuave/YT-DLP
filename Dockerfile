@@ -1,1 +1,30 @@
-FROM python:3.11-slim\n\n# Set environment variables\nENV PYTHONDONTWRITEBYTECODE=1 \\\n    PYTHONUNBUFFERED=1 \\\n    PYTHONPATH=/app\n\n# Set work directory\nWORKDIR /app\n\n# Install system dependencies for yt-dlp and other libraries\nRUN apt-get update && apt-get install -y \\\n    ffmpeg \\\n    && rm -rf /var/lib/apt/lists/*\n\n# Copy requirements and install Python dependencies\nCOPY requirements.txt .\nRUN pip install --no-cache-dir --upgrade pip && \\\n    pip install --no-cache-dir -r requirements.txt\n\n# Copy the application code\nCOPY . .\n\n# Expose the port that will be used by Render (Render uses environment variable $PORT)\nEXPOSE $PORT\n\n# Run the application using uvicorn\nCMD [\"sh\", \"-c\", \"uvicorn main:app --host 0.0.0.0 --port $PORT\"]\n
+FROM python:3.11-slim
+
+# Environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    PORT=8000
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies (ffmpeg for yt-dlp)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+# Copy project files
+COPY . .
+
+# Expose port (Render auto-injects $PORT)
+EXPOSE ${PORT}
+
+# Start FastAPI
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT}
